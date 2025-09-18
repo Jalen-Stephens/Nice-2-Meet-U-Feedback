@@ -13,8 +13,8 @@ def main():
         with connection.cursor() as cursor:
             # Run a simple query
             cursor.execute("show databases;")
-            version = cursor.fetchone()
-            print("MySQL version:", version[0])
+            version = cursor.fetchall()
+            print("Databases:", version)
 
     finally:
         connection.close()
