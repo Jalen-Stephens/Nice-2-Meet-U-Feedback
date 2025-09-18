@@ -12,7 +12,7 @@ def main():
     try:
         with connection.cursor() as cursor:
             # Run a simple query
-            cursor.execute("SELECT VERSION();")
+            cursor.execute("show databases;")
             version = cursor.fetchone()
             print("MySQL version:", version[0])
 
