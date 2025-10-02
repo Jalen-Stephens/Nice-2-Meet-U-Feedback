@@ -4,33 +4,38 @@ import os
 import socket
 from datetime import datetime
 
-from typing import Dict, List
-from uuid import UUID
+from typing import Dict, List, Tuple
+import base64
+from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, status
 from fastapi import Query, Path
 from typing import Optional
+from uuid import UUID
 
-from models.person import PersonCreate, PersonRead, PersonUpdate
-from models.address import AddressCreate, AddressRead, AddressUpdate
+
 from models.health import Health
+from models.profile_feedback import (
+    ProfileFeedbackCreate,
+    ProfileFeedbackOut,
+    ProfileFeedbackUpdate,
+)
+from models.app_feedback import (
+    AppFeedbackCreate,
+    AppFeedbackOut,
+    AppFeedbackUpdate,
+)
 
 port = int(os.environ.get("FASTAPIPORT", 8000))
 
 # -----------------------------------------------------------------------------
 # Fake in-memory "databases"
 # -----------------------------------------------------------------------------
-persons: Dict[UUID, PersonRead] = {}
-addresses: Dict[UUID, AddressRead] = {}
 
-app = FastAPI(
-    title="Person/Address API",
-    description="Demo FastAPI app using Pydantic v2 models for Person and Address",
-    version="0.1.0",
-)
+app = FastAPI(title="Feedback Microservice", version="1.0.0")
 
 # -----------------------------------------------------------------------------
-# Address endpoints
+# Health endpoints
 # -----------------------------------------------------------------------------
 
 def make_health(echo: Optional[str], path_echo: Optional[str]=None) -> Health:
@@ -55,116 +60,340 @@ def get_health_with_path(
 ):
     return make_health(echo=echo, path_echo=path_echo)
 
-@app.post("/addresses", response_model=AddressRead, status_code=201)
-def create_address(address: AddressCreate):
-    if address.id in addresses:
-        raise HTTPException(status_code=400, detail="Address with this ID already exists")
-    addresses[address.id] = AddressRead(**address.model_dump())
-    return addresses[address.id]
 
-@app.get("/addresses", response_model=List[AddressRead])
-def list_addresses(
-    street: Optional[str] = Query(None, description="Filter by street"),
-    city: Optional[str] = Query(None, description="Filter by city"),
-    state: Optional[str] = Query(None, description="Filter by state/region"),
-    postal_code: Optional[str] = Query(None, description="Filter by postal code"),
-    country: Optional[str] = Query(None, description="Filter by country"),
+# -----------------------
+# Simple cursor helpers
+# -----------------------
+def encode_cursor(offset: int) -> str:
+    return base64.urlsafe_b64encode(str(offset).encode()).decode()
+
+def decode_cursor(cursor: Optional[str]) -> int:
+    if not cursor:
+        return 0
+    try:
+        return int(base64.urlsafe_b64decode(cursor.encode()).decode())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+
+def paginate(items: List, limit: int, cursor: Optional[str]) -> Tuple[List, Optional[str]]:
+    offset = decode_cursor(cursor)
+    end = offset + limit
+    page = items[offset:end]
+    next_cursor = encode_cursor(end) if end < len(items) else None
+    return page, next_cursor
+
+# -----------------------
+# In-memory stores
+# -----------------------
+_profile_feedback_store: Dict[UUID, ProfileFeedbackOut] = {}
+_app_feedback_store: Dict[UUID, AppFeedbackOut] = {}
+
+# ===================================================================
+# PROFILE-TO-PROFILE FEEDBACK ROUTES
+# Base: /feedback/profile
+# ===================================================================
+
+@app.post(
+    "/feedback/profile",
+    response_model=ProfileFeedbackOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_profile_feedback(payload: ProfileFeedbackCreate):
+    # Optional conflict: enforce one feedback per (match_id, reviewer) if match_id present
+    if payload.match_id is not None:
+        for item in _profile_feedback_store.values():
+            if item.match_id == payload.match_id and item.reviewer_profile_id == payload.reviewer_profile_id:
+                raise HTTPException(status_code=409, detail="Feedback already exists for this (match_id, reviewer)")
+
+    now = datetime.utcnow()
+    obj = ProfileFeedbackOut(
+        id=uuid4(),
+        created_at=now,
+        updated_at=now,
+        **payload.model_dump(),
+    )
+    _profile_feedback_store[obj.id] = obj
+    return obj
+
+@app.get("/feedback/profile/{id}", response_model=ProfileFeedbackOut)
+def get_profile_feedback(id: UUID = Path(...)):
+    item = _profile_feedback_store.get(id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Not found")
+    return item
+
+@app.patch("/feedback/profile/{id}", response_model=ProfileFeedbackOut)
+def update_profile_feedback(
+    payload: ProfileFeedbackUpdate,
+    id: UUID = Path(...),
 ):
-    results = list(addresses.values())
+    item = _profile_feedback_store.get(id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Not found")
 
-    if street is not None:
-        results = [a for a in results if a.street == street]
-    if city is not None:
-        results = [a for a in results if a.city == city]
-    if state is not None:
-        results = [a for a in results if a.state == state]
-    if postal_code is not None:
-        results = [a for a in results if a.postal_code == postal_code]
-    if country is not None:
-        results = [a for a in results if a.country == country]
+    # If changing match_id/reviewer, re-check uniqueness
+    new_match_id = payload.match_id if payload.match_id is not None else item.match_id
+    new_reviewer = payload.reviewer_profile_id if payload.reviewer_profile_id is not None else item.reviewer_profile_id
+    if new_match_id is not None:
+        for other in _profile_feedback_store.values():
+            if other.id == item.id:
+                continue
+            if other.match_id == new_match_id and other.reviewer_profile_id == new_reviewer:
+                raise HTTPException(status_code=409, detail="Feedback already exists for this (match_id, reviewer)")
 
-    return results
+    data = item.model_dump()
+    data.update(payload.model_dump(exclude_unset=True))
+    data["updated_at"] = datetime.utcnow()
+    updated = ProfileFeedbackOut(**data)
+    _profile_feedback_store[id] = updated
+    return updated
 
-@app.get("/addresses/{address_id}", response_model=AddressRead)
-def get_address(address_id: UUID):
-    if address_id not in addresses:
-        raise HTTPException(status_code=404, detail="Address not found")
-    return addresses[address_id]
+@app.delete("/feedback/profile/{id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_profile_feedback(id: UUID = Path(...)):
+    if id not in _profile_feedback_store:
+        raise HTTPException(status_code=404, detail="Not found")
+    del _profile_feedback_store[id]
+    return None
 
-@app.patch("/addresses/{address_id}", response_model=AddressRead)
-def update_address(address_id: UUID, update: AddressUpdate):
-    if address_id not in addresses:
-        raise HTTPException(status_code=404, detail="Address not found")
-    stored = addresses[address_id].model_dump()
-    stored.update(update.model_dump(exclude_unset=True))
-    addresses[address_id] = AddressRead(**stored)
-    return addresses[address_id]
-
-# -----------------------------------------------------------------------------
-# Person endpoints
-# -----------------------------------------------------------------------------
-@app.post("/persons", response_model=PersonRead, status_code=201)
-def create_person(person: PersonCreate):
-    # Each person gets its own UUID; stored as PersonRead
-    person_read = PersonRead(**person.model_dump())
-    persons[person_read.id] = person_read
-    return person_read
-
-@app.get("/persons", response_model=List[PersonRead])
-def list_persons(
-    uni: Optional[str] = Query(None, description="Filter by Columbia UNI"),
-    first_name: Optional[str] = Query(None, description="Filter by first name"),
-    last_name: Optional[str] = Query(None, description="Filter by last name"),
-    email: Optional[str] = Query(None, description="Filter by email"),
-    phone: Optional[str] = Query(None, description="Filter by phone number"),
-    birth_date: Optional[str] = Query(None, description="Filter by date of birth (YYYY-MM-DD)"),
-    city: Optional[str] = Query(None, description="Filter by city of at least one address"),
-    country: Optional[str] = Query(None, description="Filter by country of at least one address"),
+@app.get("/feedback/profile", response_model=Dict[str, object])
+def list_profile_feedback(
+    reviewee_profile_id: Optional[UUID] = Query(default=None),
+    reviewer_profile_id: Optional[UUID] = Query(default=None),
+    match_id: Optional[UUID] = Query(default=None),
+    tags: Optional[str] = Query(default=None, description="Comma-separated list; OR semantics"),
+    min_overall: Optional[int] = Query(default=None, ge=1, le=5),
+    max_overall: Optional[int] = Query(default=None, ge=1, le=5),
+    since: Optional[datetime] = Query(default=None),
+    sort: str = Query(default="created_at", pattern="^(created_at|overall_experience)$"),
+    order: str = Query(default="desc", pattern="^(asc|desc)$"),
+    limit: int = Query(default=20, ge=1, le=100),
+    cursor: Optional[str] = Query(default=None),
 ):
-    results = list(persons.values())
+    items = list(_profile_feedback_store.values())
 
-    if uni is not None:
-        results = [p for p in results if p.uni == uni]
-    if first_name is not None:
-        results = [p for p in results if p.first_name == first_name]
-    if last_name is not None:
-        results = [p for p in results if p.last_name == last_name]
-    if email is not None:
-        results = [p for p in results if p.email == email]
-    if phone is not None:
-        results = [p for p in results if p.phone == phone]
-    if birth_date is not None:
-        results = [p for p in results if str(p.birth_date) == birth_date]
+    if reviewee_profile_id:
+        items = [i for i in items if i.reviewee_profile_id == reviewee_profile_id]
+    if reviewer_profile_id:
+        items = [i for i in items if i.reviewer_profile_id == reviewer_profile_id]
+    if match_id:
+        items = [i for i in items if i.match_id == match_id]
+    if since:
+        items = [i for i in items if i.created_at >= since]
+    if min_overall is not None:
+        items = [i for i in items if i.overall_experience >= min_overall]
+    if max_overall is not None:
+        items = [i for i in items if i.overall_experience <= max_overall]
+    if tags:
+        tag_set = {t.strip().lower() for t in tags.split(",") if t.strip()}
+        if tag_set:
+            items = [i for i in items if i.tags and (set(i.tags) & tag_set)]
 
-    # nested address filtering
-    if city is not None:
-        results = [p for p in results if any(addr.city == city for addr in p.addresses)]
-    if country is not None:
-        results = [p for p in results if any(addr.country == country for addr in p.addresses)]
+    reverse = order == "desc"
+    if sort == "created_at":
+        items.sort(key=lambda i: (i.created_at, i.id.hex), reverse=reverse)
+    else:  # overall_experience
+        items.sort(key=lambda i: (i.overall_experience, i.created_at, i.id.hex), reverse=reverse)
 
-    return results
+    page, next_cursor = paginate(items, limit, cursor)
+    return {"items": page, "next_cursor": next_cursor, "count": len(page)}
 
-@app.get("/persons/{person_id}", response_model=PersonRead)
-def get_person(person_id: UUID):
-    if person_id not in persons:
-        raise HTTPException(status_code=404, detail="Person not found")
-    return persons[person_id]
+@app.get("/feedback/profile/stats", response_model=Dict[str, object])
+def profile_feedback_stats(
+    reviewee_profile_id: UUID = Query(...),
+    tags: Optional[str] = Query(default=None),
+    since: Optional[datetime] = Query(default=None),
+):
+    items = [i for i in _profile_feedback_store.values() if i.reviewee_profile_id == reviewee_profile_id]
+    if since:
+        items = [i for i in items if i.created_at >= since]
+    if tags:
+        tag_set = {t.strip().lower() for t in tags.split(",") if t.strip()}
+        if tag_set:
+            items = [i for i in items if i.tags and (set(i.tags) & tag_set)]
 
-@app.patch("/persons/{person_id}", response_model=PersonRead)
-def update_person(person_id: UUID, update: PersonUpdate):
-    if person_id not in persons:
-        raise HTTPException(status_code=404, detail="Person not found")
-    stored = persons[person_id].model_dump()
-    stored.update(update.model_dump(exclude_unset=True))
-    persons[person_id] = PersonRead(**stored)
-    return persons[person_id]
+    total = len(items)
+    if total == 0:
+        return {
+            "reviewee_profile_id": reviewee_profile_id,
+            "count_total": 0,
+            "avg_overall_experience": None,
+            "distribution_overall_experience": {str(k): 0 for k in range(1, 6)},
+            "facet_averages": {"safety_feeling": None, "respectfulness": None},
+            "top_tags": [],
+        }
 
-# -----------------------------------------------------------------------------
-# Root
-# -----------------------------------------------------------------------------
-@app.get("/")
-def root():
-    return {"message": "Welcome to the Person/Address API. See /docs for OpenAPI UI."}
+    def avg(nums: List[int]) -> float:
+        return round(sum(nums) / len(nums), 3) if nums else None
+
+    overall_vals = [i.overall_experience for i in items]
+    dist = {str(k): 0 for k in range(1, 6)}
+    for v in overall_vals:
+        dist[str(v)] += 1
+
+    safety_vals = [i.safety_feeling for i in items if i.safety_feeling is not None]
+    respect_vals = [i.respectfulness for i in items if i.respectfulness is not None]
+
+    tag_counts: Dict[str, int] = {}
+    for i in items:
+        if i.tags:
+            for t in i.tags:
+                tag_counts[t] = tag_counts.get(t, 0) + 1
+    top_tags = sorted(tag_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+
+    return {
+        "reviewee_profile_id": reviewee_profile_id,
+        "count_total": total,
+        "avg_overall_experience": avg(overall_vals),
+        "distribution_overall_experience": dist,
+        "facet_averages": {
+            "safety_feeling": avg(safety_vals),
+            "respectfulness": avg(respect_vals),
+        },
+        "top_tags": [{"tag": k, "count": v} for k, v in top_tags],
+    }
+
+# ===================================================================
+# APP-LEVEL FEEDBACK ROUTES
+# Base: /feedback/app
+# ===================================================================
+
+@app.post(
+    "/feedback/app",
+    response_model=AppFeedbackOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_app_feedback(payload: AppFeedbackCreate):
+    now = datetime.utcnow()
+    obj = AppFeedbackOut(
+        id=uuid4(),
+        created_at=now,
+        updated_at=now,
+        **payload.model_dump(),
+    )
+    _app_feedback_store[obj.id] = obj
+    return obj
+
+@app.get("/feedback/app/{id}", response_model=AppFeedbackOut)
+def get_app_feedback(id: UUID = Path(...)):
+    item = _app_feedback_store.get(id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Not found")
+    return item
+
+@app.patch("/feedback/app/{id}", response_model=AppFeedbackOut)
+def update_app_feedback(
+    payload: AppFeedbackUpdate,
+    id: UUID = Path(...),
+):
+    item = _app_feedback_store.get(id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    data = item.model_dump()
+    data.update(payload.model_dump(exclude_unset=True))
+    data["updated_at"] = datetime.utcnow()
+    updated = AppFeedbackOut(**data)
+    _app_feedback_store[id] = updated
+    return updated
+
+@app.delete("/feedback/app/{id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_app_feedback(id: UUID = Path(...)):
+    if id not in _app_feedback_store:
+        raise HTTPException(status_code=404, detail="Not found")
+    del _app_feedback_store[id]
+    return None
+
+@app.get("/feedback/app", response_model=Dict[str, object])
+def list_app_feedback(
+    author_profile_id: Optional[UUID] = Query(default=None),
+    tags: Optional[str] = Query(default=None, description="Comma-separated list; OR semantics"),
+    min_overall: Optional[int] = Query(default=None, ge=1, le=5),
+    max_overall: Optional[int] = Query(default=None, ge=1, le=5),
+    since: Optional[datetime] = Query(default=None),
+    sort: str = Query(default="created_at", pattern="^(created_at|overall)$"),
+    order: str = Query(default="desc", pattern="^(asc|desc)$"),
+    limit: int = Query(default=20, ge=1, le=100),
+    cursor: Optional[str] = Query(default=None),
+):
+    items = list(_app_feedback_store.values())
+
+    if author_profile_id:
+        items = [i for i in items if i.author_profile_id == author_profile_id]
+    if since:
+        items = [i for i in items if i.created_at >= since]
+    if min_overall is not None:
+        items = [i for i in items if i.overall >= min_overall]
+    if max_overall is not None:
+        items = [i for i in items if i.overall <= max_overall]
+    if tags:
+        tag_set = {t.strip().lower() for t in tags.split(",") if t.strip()}
+        if tag_set:
+            items = [i for i in items if i.tags and (set(i.tags) & tag_set)]
+
+    reverse = order == "desc"
+    if sort == "created_at":
+        items.sort(key=lambda i: (i.created_at, i.id.hex), reverse=reverse)
+    else:  # overall
+        items.sort(key=lambda i: (i.overall, i.created_at, i.id.hex), reverse=reverse)
+
+    page, next_cursor = paginate(items, limit, cursor)
+    return {"items": page, "next_cursor": next_cursor, "count": len(page)}
+
+@app.get("/feedback/app/stats", response_model=Dict[str, object])
+def app_feedback_stats(
+    tags: Optional[str] = Query(default=None),
+    since: Optional[datetime] = Query(default=None),
+):
+    items = list(_app_feedback_store.values())
+    if since:
+        items = [i for i in items if i.created_at >= since]
+    if tags:
+        tag_set = {t.strip().lower() for t in tags.split(",") if t.strip()}
+        if tag_set:
+            items = [i for i in items if i.tags and (set(i.tags) & tag_set)]
+
+    total = len(items)
+    if total == 0:
+        return {
+            "count_total": 0,
+            "avg_overall": None,
+            "distribution_overall": {str(k): 0 for k in range(1, 6)},
+            "facet_averages": {"usability": None, "reliability": None, "performance": None, "support_experience": None},
+            "top_tags": [],
+        }
+
+    def avg(nums: List[int]) -> float:
+        return round(sum(nums) / len(nums), 3) if nums else None
+
+    overall_vals = [i.overall for i in items]
+    dist = {str(k): 0 for k in range(1, 6)}
+    for v in overall_vals:
+        dist[str(v)] += 1
+
+    usability_vals = [i.usability for i in items if i.usability is not None]
+    reliability_vals = [i.reliability for i in items if i.reliability is not None]
+    performance_vals = [i.performance for i in items if i.performance is not None]
+    support_vals = [i.support_experience for i in items if i.support_experience is not None]
+
+    tag_counts: Dict[str, int] = {}
+    for i in items:
+        if i.tags:
+            for t in i.tags:
+                tag_counts[t] = tag_counts.get(t, 0) + 1
+    top_tags = sorted(tag_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+
+    return {
+        "count_total": total,
+        "avg_overall": avg(overall_vals),
+        "distribution_overall": dist,
+        "facet_averages": {
+            "usability": avg(usability_vals),
+            "reliability": avg(reliability_vals),
+            "performance": avg(performance_vals),
+            "support_experience": avg(support_vals),
+        },
+        "top_tags": [{"tag": k, "count": v} for k, v in top_tags],
+    }
 
 # -----------------------------------------------------------------------------
 # Entrypoint for `python main.py`
