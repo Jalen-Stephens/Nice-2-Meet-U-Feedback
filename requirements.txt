@@ -1,15 +1,30 @@
-annotated-types==0.7.0
-anyio==4.10.0
-click==8.2.1
-dnspython==2.7.0
-email-validator==2.3.0
+# ---- Core Web Framework ----
 fastapi==0.116.1
-h11==0.16.0
-idna==3.10
+starlette==0.47.3
+uvicorn[standard]==0.35.0
+
+# ---- Data Validation & Types ----
 pydantic==2.11.7
 pydantic_core==2.33.2
-sniffio==1.3.1
-starlette==0.47.3
-typing-inspection==0.4.1
 typing_extensions==4.15.0
-uvicorn==0.35.0
+annotated-types==0.7.0
+typing-inspection==0.4.1
+
+# ---- Async & Network ----
+anyio==4.10.0
+sniffio==1.3.1
+click==8.2.1
+h11==0.16.0
+idna==3.10
+dnspython==2.7.0
+
+# ---- Database ----
+mysql-connector-python==9.0.0
+
+# ---- Environment & Config ----
+python-dotenv==1.0.1
+
+# ---- Optional performance & testing ----
+orjson==3.10.3
+httpx==0.27.2
+pytest==8.3.3
