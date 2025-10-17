@@ -211,7 +211,7 @@ def create_profile_feedback(payload: ProfileFeedbackCreate):
             (id, created_at, updated_at, reviewer_profile_id, reviewee_profile_id, match_id,
              overall_experience, would_meet_again, safety_feeling, respectfulness,
              headline, comment, tags)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSON))
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 pid, now, now,
@@ -314,11 +314,12 @@ def list_profile_feedback(
     if min_overall is not None: where.append("overall_experience >= %s"); params.append(min_overall)
     if max_overall is not None: where.append("overall_experience <= %s"); params.append(max_overall)
     if tags:
+        # Example builder for WHERE on MariaDB
         tag_list = [t.strip().lower() for t in tags.split(",") if t.strip()]
         if tag_list:
-            # require overlap with provided tags
-            where.append("JSON_OVERLAPS(tags, CAST(%s AS JSON))")
-            params.append(str(tag_list).replace("'", '"'))
+            where.append("(" + " OR ".join(["JSON_SEARCH(tags, 'one', %s) IS NOT NULL"] * len(tag_list)) + ")")
+            params.extend(tag_list)
+
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     order_col = "created_at" if sort == "created_at" else "overall_experience"
