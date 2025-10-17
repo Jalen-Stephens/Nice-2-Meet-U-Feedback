@@ -445,7 +445,7 @@ def create_app_feedback(payload: AppFeedbackCreate):
         INSERT INTO feedback_app
         (id, created_at, updated_at, author_profile_id, overall, usability, reliability, performance, support_experience,
          headline, comment, tags)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSON))
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             fid, now, now,
