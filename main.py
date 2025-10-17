@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os, socket, base64, logging
+import os, socket, base64, logging, json
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
@@ -164,6 +164,23 @@ def get_health_with_path(
 # -------------------------------------------------------------------
 # Mappers (DB row -> Pydantic)
 # -------------------------------------------------------------------
+def _coerce_tags(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x) for x in value]
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode()
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+            if isinstance(decoded, list):
+                return [str(x) for x in decoded]
+        except Exception:
+            pass
+        return [s.strip() for s in value.split(",") if s.strip()]
+    return [str(value)]
+
 def row_to_profile_out(r: dict) -> ProfileFeedbackOut:
     return ProfileFeedbackOut(
         id=UUID(r["id"]),
@@ -178,7 +195,7 @@ def row_to_profile_out(r: dict) -> ProfileFeedbackOut:
         respectfulness=r["respectfulness"],
         headline=r["headline"],
         comment=r["comment"],
-        tags=r["tags"],  # mysql-connector returns parsed JSON for JSON columns
+        tags=_coerce_tags(r["tags"]),
     )
 
 def row_to_app_out(r: dict) -> AppFeedbackOut:
@@ -194,7 +211,7 @@ def row_to_app_out(r: dict) -> AppFeedbackOut:
         support_experience=r["support_experience"],
         headline=r["headline"],
         comment=r["comment"],
-        tags=r["tags"],
+        tags=_coerce_tags(r["tags"]),
     )
 
 # -------------------------------------------------------------------
@@ -220,7 +237,7 @@ def create_profile_feedback(payload: ProfileFeedbackCreate):
                 payload.overall_experience, payload.would_meet_again,
                 payload.safety_feeling, payload.respectfulness,
                 payload.headline, payload.comment,
-                None if payload.tags is None else (str(payload.tags).replace("'", '"')),
+                None if payload.tags is None else json.dumps(payload.tags),
             ),
         )
     except mysql.connector.Error as e:
@@ -270,7 +287,7 @@ def update_profile_feedback(payload: ProfileFeedbackUpdate, id: UUID = Path(...)
 
     if "tags" in data:
         tags = data["tags"]
-        setf("tags", None if tags is None else (str(tags).replace("'", '"')))
+        setf("tags", None if tags is None else json.dumps(tags))
 
     if not fields:
         # no-op, just return current row
@@ -435,7 +452,7 @@ def create_app_feedback(payload: AppFeedbackCreate):
             str(payload.author_profile_id) if payload.author_profile_id else None,
             payload.overall, payload.usability, payload.reliability, payload.performance, payload.support_experience,
             payload.headline, payload.comment,
-            None if payload.tags is None else (str(payload.tags).replace("'", '"')),
+            None if payload.tags is None else json.dumps(payload.tags),
         ),
     )
     row = run("SELECT * FROM feedback_app WHERE id=%s", (fid,), fetch="one")
@@ -477,7 +494,7 @@ def update_app_feedback(payload: AppFeedbackUpdate, id: UUID = Path(...)):
 
     if "tags" in data:
         tags = data["tags"]
-        setf("tags", None if tags is None else (str(tags).replace("'", '"')))
+        setf("tags", None if tags is None else json.dumps(tags))
 
     if not fields:
         return row_to_app_out(existing)
